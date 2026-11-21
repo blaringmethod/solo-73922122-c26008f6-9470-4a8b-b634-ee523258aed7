@@ -25,11 +25,16 @@ class Settings:
     data_dir: Path
     db_path: Path
     blob_dir: Path
+    delta_dir: Path
     temp_dir: Path
     max_file_bytes: int
     max_releases: int
     # 固定深度完整二叉树：深度 7 -> 128 个叶子槽位，与累计上限一致。
     tree_depth: int
+    # 差分链最大层数：一件差分稿的还原最多应用四层差分，超出须整件上传。
+    max_delta_depth: int
+    # 单次差分提交允许的替换段数量上限（需求规定 1~8 段）。
+    max_delta_segments: int
 
     @property
     def tree_capacity(self) -> int:
@@ -47,15 +52,18 @@ class Settings:
             data_dir=data_dir,
             db_path=data_dir / "release.db",
             blob_dir=data_dir / "blobs",
+            delta_dir=data_dir / "deltas",
             temp_dir=data_dir / "tmp",
             max_file_bytes=_env_int("MAX_FILE_BYTES", 1 * 1024 * 1024),
             max_releases=max_releases,
             tree_depth=tree_depth,
+            max_delta_depth=_env_int("MAX_DELTA_DEPTH", 4),
+            max_delta_segments=_env_int("MAX_DELTA_SEGMENTS", 8),
         )
         return settings
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.blob_dir, self.temp_dir):
+        for path in (self.data_dir, self.blob_dir, self.delta_dir, self.temp_dir):
             path.mkdir(parents=True, exist_ok=True)
 
 

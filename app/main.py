@@ -2,16 +2,27 @@
 
 流程与不变量
 ------------
-1. 上传先落共享卷（临时文件 fsync + 原子改名），写盘失败返回 507 且无库记录；
+1. 整件上传先落共享卷（临时文件 fsync + 原子改名），写盘失败返回 507 且无库记录；
 2. 数据库事务 BEGIN IMMEDIATE 串行化双实例并发：
    - 同 (站号, 日期, 单号) 同字节 -> 复用既有记录（幂等重试）；
    - 同键异字节 -> 409 拒绝，记录不可改；
    - 超累计上限 -> 409 拒绝；
 3. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
-4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
+4. 下载与证明只服务已提交记录；启动自检发现缺件或差分链无法重建则健康检查置为
+   不可用，拒绝发布、证明与下载。
+
+差分发布（POST /releases/delta）
+--------------------------------
+* 提交同站同日基稿的发布序号、新单号与 1~8 个互不重叠的非空字节区间替换段；
+* 共享卷只保存差分文档与基稿引用（deltas/ 内容寻址），不保存重建全文；
+* 差分稿可再作基稿，每件还原最多应用四层差分，超出返回 409 并提示整件上传；
+* 叶子仍按重建全文的摘要与长度登记，沿用原件大小上限与同单重试规则；
+* 基稿无法核验或差分落盘失败时，不新增发布记录、不推进检查点。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from contextlib import asynccontextmanager
 from datetime import date
@@ -20,9 +31,11 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+from . import delta as delta_mod
 from . import merkle
 from .config import settings
 from .db import ConflictError, Database
+from .reconstruct import ReconstructionError, Reconstructor
 from .schemas import (
     AppendProofOut,
     CheckpointOut,
@@ -32,28 +45,40 @@ from .schemas import (
     PublishResult,
     ReleaseOut,
 )
-from .storage import BlobError, BlobStore
+from .storage import BlobError, BlobStore, DeltaStore
 
 blob_store = BlobStore(settings)
+delta_store = DeltaStore(settings)
 database = Database(settings)
+reconstructor = Reconstructor(settings, database, blob_store, delta_store)
 
-# 启动自检结果；发现缺件时拒绝出具任何证明与下载。
+# 启动自检结果；发现缺件/重建失败时拒绝出具任何证明与下载。
 _startup_problems: list[str] = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _startup_problems
-    _startup_problems = database.integrity_problems(blob_store.verify_present)
+    # 结构级自检：序号稠密、原件/差分文档齐全且摘要相符、检查点连续。
+    problems = database.integrity_problems(
+        blob_store.verify_present, delta_store.verify_present
+    )
+    # 全链重建自检：逐条还原并比对登记摘要，任何差分链断裂都拒绝带故障服务。
+    for record in database.list_releases():
+        try:
+            reconstructor.reconstruct(record)
+        except ReconstructionError as exc:
+            problems.append(f"release id={record['id']} 重建失败：{exc}")
+    _startup_problems = problems
     yield
 
 
 app = FastAPI(
     title="河流水质站日 CSV 发布服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "不可改的原件发布、SHA-256 Merkle 检查点、单件纳入证明与检查点追加证明。"
-        "原件字节存共享卷，数据库只存目录与摘要。"
+        "不可改的原件/差分发布、SHA-256 Merkle 检查点、单件纳入证明与检查点追加"
+        "证明。原件与差分文档字节存共享卷，数据库只存目录与摘要；差分不保存重建全文。"
     ),
     lifespan=lifespan,
 )
@@ -81,20 +106,20 @@ def _require_healthy() -> None:
         raise HTTPException(
             503,
             detail={
-                "message": "存储自检未通过，存在缺件记录，服务拒绝出具证明",
+                "message": "存储自检未通过，存在缺件或重建失败记录，服务拒绝出具证明",
                 "problems": _startup_problems,
             },
         )
 
 
 # --------------------------------------------------------------------------- #
-# 发布
+# 整件发布
 # --------------------------------------------------------------------------- #
 @app.post(
     "/releases",
     response_model=PublishResult,
     status_code=201,
-    summary="发布站日 CSV（同单同输入重试复用，异输入拒绝）",
+    summary="整件发布站日 CSV（同单同输入重试复用，异输入拒绝）",
 )
 async def publish_release(
     station_id: str = Form(..., description="站号"),
@@ -141,6 +166,131 @@ async def publish_release(
 
 
 # --------------------------------------------------------------------------- #
+# 差分发布
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/releases/delta",
+    response_model=PublishResult,
+    status_code=201,
+    summary="差分发布：对同站同日基稿做 1~8 段字节区间替换",
+)
+async def publish_delta_release(
+    station_id: str = Form(..., description="站号（须与基稿同站同日）"),
+    sample_date: str = Form(..., description="采样日期 YYYY-MM-DD（须与基稿同日）"),
+    order_no: str = Form(..., description="新发布单号"),
+    base_release_id: int = Form(..., description="基稿的发布序号（release id）"),
+    segments: str = Form(
+        ...,
+        description=(
+            "替换段 JSON 数组，每段 {start,end,b64}：左闭右开非空字节区间，"
+            "区间互不重叠，b64 为标准 Base64 替换内容（可为空串表示删除区间）"
+        ),
+    ),
+):
+    _require_healthy()
+    _validate_identity(station_id, sample_date, order_no)
+    if not isinstance(base_release_id, int) or base_release_id <= 0:
+        raise HTTPException(422, "base_release_id 须为正整数")
+
+    # 解析 segments JSON（表单里只能以字符串携带 JSON）。
+    try:
+        raw_segments = json.loads(segments)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, f"segments 不是合法 JSON：{exc}")
+    try:
+        parsed_segments = delta_mod.parse_segments(
+            raw_segments, settings.max_delta_segments
+        )
+    except delta_mod.DeltaValidationError as exc:
+        raise HTTPException(422, str(exc))
+
+    # 取基稿目录记录：必须存在且同站同日。
+    base_record = await run_in_threadpool(
+        database.get_release_by_id, base_release_id
+    )
+    if base_record is None:
+        raise HTTPException(404, f"未找到发布序号 {base_release_id} 对应的基稿记录")
+    if (
+        base_record["station_id"] != station_id
+        or base_record["sample_date"] != sample_date
+    ):
+        raise HTTPException(
+            422,
+            "基稿与差分稿必须同站同日：基稿为 "
+            f"{base_record['station_id']} / {base_record['sample_date']}",
+        )
+
+    # 链深预检：基稿链深 +1 超过四层时直接拒绝，提示整件上传（无需先落盘）。
+    new_depth = base_record["chain_depth"] + 1
+    if new_depth > settings.max_delta_depth:
+        raise HTTPException(
+            409,
+            detail=(
+                f"该差分稿链深将达 {new_depth} 层，超过最多 "
+                f"{settings.max_delta_depth} 层差分的还原上限，"
+                "请改用 POST /releases 整件上传"
+            ),
+        )
+
+    # 还原并核验基稿：基稿无法核验时不得新增发布记录或推进检查点。
+    try:
+        base_bytes = await run_in_threadpool(reconstructor.reconstruct, base_record)
+    except ReconstructionError as exc:
+        raise HTTPException(409, f"基稿无法核验，拒绝差分发布：{exc}")
+
+    # 区间必须落在基稿字节范围内；应用替换段得到重建全文。
+    try:
+        delta_mod.validate_ranges(parsed_segments, len(base_bytes))
+        rebuilt = delta_mod.apply_segments(base_bytes, parsed_segments)
+    except delta_mod.DeltaValidationError as exc:
+        raise HTTPException(422, str(exc))
+    if len(rebuilt) == 0:
+        raise HTTPException(422, "替换结果为空文件，拒绝发布")
+    if len(rebuilt) > settings.max_file_bytes:
+        raise HTTPException(
+            413,
+            f"重建全文 {len(rebuilt)} 字节超过单件上限 "
+            f"{settings.max_file_bytes} 字节（1 MiB）",
+        )
+
+    rebuilt_digest = hashlib.sha256(rebuilt).hexdigest()
+    # 规范化差分文档（含基稿引用与全部替换段），内容寻址原子落盘。
+    doc_bytes = delta_mod.canonical_delta_doc(
+        base_release_id=base_record["id"],
+        base_blob_sha256=base_record["blob_sha256"],
+        base_size=base_record["size"],
+        segments=parsed_segments,
+    )
+    try:
+        doc_digest, _path = await run_in_threadpool(delta_store.store, doc_bytes)
+    except BlobError as exc:
+        # 差分落盘失败：无库记录、检查点不推进，客户端可原样重试。
+        return JSONResponse(status_code=507, content={"detail": str(exc)})
+
+    try:
+        record, reused = await run_in_threadpool(
+            database.publish_delta,
+            station_id,
+            sample_date,
+            order_no,
+            rebuilt_digest,
+            len(rebuilt),
+            base_record["id"],
+            doc_digest,
+            new_depth,
+        )
+    except ConflictError as exc:
+        raise HTTPException(409, str(exc))
+
+    checkpoint = await run_in_threadpool(database.latest_checkpoint)
+    return PublishResult(
+        reused=reused,
+        release=ReleaseOut(**record),
+        checkpoint=CheckpointOut(**checkpoint),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 查询与取件
 # --------------------------------------------------------------------------- #
 @app.get("/releases", response_model=list[ReleaseOut], summary="列出全部发布记录")
@@ -165,7 +315,7 @@ async def get_release(station_id: str, sample_date: str, order_no: str):
 
 @app.get(
     "/releases/{station_id}/{sample_date}/{order_no}/download",
-    summary="下载已提交原件（仅对应完整已提交字节）",
+    summary="下载已提交内容（差分件按链重建原字节，重建失败拒绝取件）",
 )
 async def download_release(station_id: str, sample_date: str, order_no: str):
     _require_healthy()
@@ -174,13 +324,11 @@ async def download_release(station_id: str, sample_date: str, order_no: str):
     )
     if record is None:
         raise HTTPException(404, "未找到该站号/日期/发布单号对应的发布记录")
-    present = await run_in_threadpool(
-        blob_store.verify_present, record["blob_sha256"]
-    )
-    if not present:
-        # 理论上启动自检已拦截；此处兜底，绝不返回缺件/错件。
-        raise HTTPException(503, "原件缺失或摘要不符，拒绝下载")
-    data = await run_in_threadpool(blob_store.read, record["blob_sha256"])
+    try:
+        data = await run_in_threadpool(reconstructor.reconstruct, record)
+    except ReconstructionError as exc:
+        # 绝不输出无法核验的字节：缺件、文档损坏、摘要不符一律拒绝取件。
+        raise HTTPException(503, f"重建失败，拒绝取件：{exc}")
     filename = f"{station_id}_{sample_date}_{order_no}.csv"
     return Response(
         content=data,
@@ -229,7 +377,7 @@ async def list_checkpoints():
 @app.get(
     "/releases/{station_id}/{sample_date}/{order_no}/inclusion-proof",
     response_model=InclusionProofOut,
-    summary="单件纳入证明（路径长度 = 树深度，O(log n)）",
+    summary="单件纳入证明（路径长度 = 树深度，O(log n)；差分件按重建全文登记）",
 )
 async def inclusion_proof(station_id: str, sample_date: str, order_no: str):
     _require_healthy()
@@ -295,9 +443,11 @@ async def append_proof(old_seq: int):
 async def health():
     problems = list(_startup_problems)
     rows = await run_in_threadpool(database.list_releases)
+    delta_count = sum(1 for r in rows if r.get("kind") == "delta")
     return HealthOut(
         status="ok" if not problems else "degraded",
         release_count=len(rows),
+        delta_count=delta_count,
         problems=problems,
     )
 
@@ -311,5 +461,7 @@ def root():
             "max_file_bytes": settings.max_file_bytes,
             "max_releases": settings.max_releases,
             "tree_depth": settings.tree_depth,
+            "max_delta_depth": settings.max_delta_depth,
+            "max_delta_segments": settings.max_delta_segments,
         },
     }

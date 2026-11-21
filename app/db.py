@@ -1,4 +1,4 @@
-"""SQLite 持久层：目录与摘要（不存原件字节）。
+"""SQLite 持久层：目录与摘要（不存原件/全文字节）。
 
 并发模型
 --------
@@ -6,6 +6,14 @@
 * 发布事务使用 ``BEGIN IMMEDIATE``，跨实例写操作被数据库锁串行化，
   后到者阻塞等待后重检唯一键，因此不会分叉、不会互相覆盖。
 * 无任何 UPDATE/DELETE 路径，发布后记录不可改、不可删。
+
+差分发布
+--------
+``releases`` 同时登记整件（``kind='full'``）与差分件（``kind='delta'``）。
+差分件的 ``blob_sha256/size`` 始终针对**重建全文**，因此 Merkle 叶子载荷、
+纳入证明与离线核验与整件发布完全一致；差分文档自身摘要存于
+``delta_blob_sha256``，基稿引用存于 ``base_id``，``chain_depth`` 记录差分层数
+（全文 0，差分 1~4）。
 """
 from __future__ import annotations
 
@@ -13,22 +21,26 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator
 
 from . import merkle
 from .config import Settings
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS releases (
-    id           INTEGER PRIMARY KEY,          -- 1 起稠密序号，叶子下标 = id - 1
-    station_id   TEXT NOT NULL,
-    sample_date  TEXT NOT NULL,
-    order_no     TEXT NOT NULL,
-    blob_sha256  TEXT NOT NULL,
-    size         INTEGER NOT NULL,
-    created_at   TEXT NOT NULL,
-    UNIQUE(station_id, sample_date, order_no)
+    id                  INTEGER PRIMARY KEY,          -- 1 起稠密序号，叶子下标 = id - 1
+    station_id          TEXT NOT NULL,
+    sample_date         TEXT NOT NULL,
+    order_no            TEXT NOT NULL,
+    blob_sha256         TEXT NOT NULL,                -- 重建全文（或原件）的 SHA-256
+    size                INTEGER NOT NULL,             -- 重建全文（或原件）字节长度
+    created_at          TEXT NOT NULL,
+    kind                TEXT NOT NULL DEFAULT 'full', -- full | delta
+    base_id             INTEGER,                      -- 差分件基稿 release id
+    delta_blob_sha256   TEXT,                         -- 差分文档自身 SHA-256
+    chain_depth         INTEGER NOT NULL DEFAULT 0,   -- 全文 0，差分 1..4
+    UNIQUE(station_id, sample_date, order_no),
+    FOREIGN KEY(base_id) REFERENCES releases(id)
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -42,6 +54,14 @@ CREATE TABLE IF NOT EXISTS meta (
     value  TEXT NOT NULL
 );
 """
+
+# 旧库（v1 表结构）升级所需的新增列：列名 -> DDL 片段。
+_MIGRATION_COLUMNS = {
+    "kind": "ALTER TABLE releases ADD COLUMN kind TEXT NOT NULL DEFAULT 'full'",
+    "base_id": "ALTER TABLE releases ADD COLUMN base_id INTEGER",
+    "delta_blob_sha256": "ALTER TABLE releases ADD COLUMN delta_blob_sha256 TEXT",
+    "chain_depth": "ALTER TABLE releases ADD COLUMN chain_depth INTEGER NOT NULL DEFAULT 0",
+}
 
 
 def _utcnow() -> str:
@@ -81,6 +101,14 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.executescript(SCHEMA)
+                # 旧库平滑升级：补齐差分功能新增列，已有记录全部视为全文件。
+                existing = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(releases)").fetchall()
+                }
+                for column, ddl in _MIGRATION_COLUMNS.items():
+                    if column not in existing:
+                        conn.execute(ddl)
                 # 零号检查点（空树根），幂等创建。
                 empty = merkle.empty_root(self._settings.tree_depth).hex()
                 conn.execute(
@@ -104,17 +132,57 @@ class Database:
         blob_sha256: str,
         size: int,
     ) -> tuple[dict, bool]:
-        """串行化发布。返回 (发布记录, 是否复用既有记录)。
+        """串行化整件发布。返回 (发布记录, 是否复用既有记录)。
 
         调用方必须已把原件原子落盘成功后再调用本方法，
         从而保证“库中有记录 => 卷上有完整原件”。
         """
+        return self._publish_with_retry(
+            station_id=station_id,
+            sample_date=sample_date,
+            order_no=order_no,
+            blob_sha256=blob_sha256,
+            size=size,
+            kind="full",
+            base_id=None,
+            delta_blob_sha256=None,
+            chain_depth=0,
+        )
+
+    def publish_delta(
+        self,
+        station_id: str,
+        sample_date: str,
+        order_no: str,
+        rebuilt_sha256: str,
+        rebuilt_size: int,
+        base_id: int,
+        delta_doc_sha256: str,
+        chain_depth: int,
+    ) -> tuple[dict, bool]:
+        """串行化差分发布。
+
+        调用方必须已：① 成功还原并核验基稿；② 把差分文档原子落盘；
+        ③ 在本地算出重建全文摘要与长度。本方法只做目录登记与检查点追加，
+        失败时不会产生任何记录，差分文档为内容寻址的孤立文件，可安全重试。
+        """
+        return self._publish_with_retry(
+            station_id=station_id,
+            sample_date=sample_date,
+            order_no=order_no,
+            blob_sha256=rebuilt_sha256,
+            size=rebuilt_size,
+            kind="delta",
+            base_id=base_id,
+            delta_blob_sha256=delta_doc_sha256,
+            chain_depth=chain_depth,
+        )
+
+    def _publish_with_retry(self, **fields) -> tuple[dict, bool]:
         # 双实例并发时 BEGIN IMMEDIATE 可能撞上写锁；busy_timeout 之外再有限重试。
         for attempt in range(3):
             try:
-                return self._publish_once(
-                    station_id, sample_date, order_no, blob_sha256, size
-                )
+                return self._publish_once(**fields)
             except sqlite3.OperationalError as exc:
                 if "locked" in str(exc).lower() and attempt < 2:
                     time.sleep(0.2 * (attempt + 1))
@@ -129,6 +197,10 @@ class Database:
         order_no: str,
         blob_sha256: str,
         size: int,
+        kind: str,
+        base_id: int | None,
+        delta_blob_sha256: str | None,
+        chain_depth: int,
     ) -> tuple[dict, bool]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -147,7 +219,7 @@ class Database:
                     conn.rollback()  # 只读复用，不产生写入
                     if not same:
                         raise ConflictError(
-                            "同一站号/日期/发布单号已存在且原件内容不同，禁止改写"
+                            "同一站号/日期/发布单号已存在且重建内容不同，禁止改写"
                         )
                     return record, True
 
@@ -162,7 +234,9 @@ class Database:
 
                 cursor = conn.execute(
                     "INSERT INTO releases(station_id, sample_date, order_no, "
-                    "blob_sha256, size, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "blob_sha256, size, created_at, kind, base_id, "
+                    "delta_blob_sha256, chain_depth) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         station_id,
                         sample_date,
@@ -170,6 +244,10 @@ class Database:
                         blob_sha256,
                         size,
                         _utcnow(),
+                        kind,
+                        base_id,
+                        delta_blob_sha256,
+                        chain_depth,
                     ),
                 )
                 release_id = cursor.lastrowid
@@ -193,6 +271,7 @@ class Database:
 
     @staticmethod
     def _leaf_hashes_locked(conn: sqlite3.Connection) -> list[bytes]:
+        # 叶子只依赖重建全文摘要与长度，全文件/差分件载荷格式完全一致。
         rows = conn.execute(
             "SELECT station_id, sample_date, order_no, blob_sha256, size "
             "FROM releases ORDER BY id ASC"
@@ -260,22 +339,65 @@ class Database:
     # ------------------------------------------------------------------ #
     # 启动自检：不得带着缺件记录对外服务
     # ------------------------------------------------------------------ #
-    def integrity_problems(self, blob_verifier) -> list[str]:
+    def integrity_problems(self, blob_verifier, delta_verifier=None) -> list[str]:
+        """结构级自检：序号稠密、原件/差分文档齐全且摘要相符、检查点连续。
+
+        差分链的逐跳重建核验由调用方（app.main）通过 Reconstructor 完成，
+        本方法只保证目录引用的每个卷上文件都存在且内容寻址摘要正确。
+        """
         problems: list[str] = []
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, blob_sha256 FROM releases ORDER BY id"
+                "SELECT id, kind, blob_sha256, delta_blob_sha256, base_id, "
+                "chain_depth FROM releases ORDER BY id"
             ).fetchall()
             expected_ids = list(range(1, len(rows) + 1))
             actual_ids = [r["id"] for r in rows]
             if actual_ids != expected_ids:
                 problems.append("releases 主键不稠密，存在缺口或乱序")
+
+            known_ids = set(actual_ids)
             for row in rows:
-                if not blob_verifier(row["blob_sha256"]):
-                    problems.append(
-                        f"release id={row['id']} 的原件缺失或摘要不符 "
-                        f"(sha256={row['blob_sha256'][:12]}...)"
-                    )
+                kind = row["kind"]
+                if kind not in ("full", "delta"):
+                    problems.append(f"release id={row['id']} kind 非法：{kind!r}")
+                    continue
+                if kind == "full":
+                    if row["chain_depth"] != 0 or row["base_id"] is not None:
+                        problems.append(
+                            f"release id={row['id']} 全文件链深/基稿引用字段异常"
+                        )
+                    if not blob_verifier(row["blob_sha256"]):
+                        problems.append(
+                            f"release id={row['id']} 的原件缺失或摘要不符 "
+                            f"(sha256={row['blob_sha256'][:12]}...)"
+                        )
+                else:
+                    if not 1 <= row["chain_depth"] <= self._settings.max_delta_depth:
+                        problems.append(
+                            f"release id={row['id']} 差分链深 "
+                            f"{row['chain_depth']} 超出 1..{self._settings.max_delta_depth}"
+                        )
+                    if row["base_id"] is None or row["base_id"] not in known_ids:
+                        problems.append(
+                            f"release id={row['id']} 的基稿引用缺失或悬空"
+                        )
+                    elif row["base_id"] >= row["id"]:
+                        problems.append(
+                            f"release id={row['id']} 基稿序号必须早于自身序号"
+                        )
+                    if not row["delta_blob_sha256"]:
+                        problems.append(
+                            f"release id={row['id']} 缺少差分文档摘要"
+                        )
+                    elif delta_verifier is not None and not delta_verifier(
+                        row["delta_blob_sha256"]
+                    ):
+                        problems.append(
+                            f"release id={row['id']} 的差分文档缺失或摘要不符 "
+                            f"(sha256={row['delta_blob_sha256'][:12]}...)"
+                        )
+
             leaves = self._leaf_hashes_locked(conn)
             root = merkle.root_from_leaves(leaves, self._settings.tree_depth)
             cp_rows = conn.execute(
